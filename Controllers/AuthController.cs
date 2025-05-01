@@ -3,6 +3,7 @@ using GestionTareasApi.Dtos;
 using GestionTareasApi.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
 using Swashbuckle.AspNetCore.Annotations;
 using System.IdentityModel.Tokens.Jwt;
@@ -11,8 +12,8 @@ using System.Text;
 
 namespace GestionTareasApi.Controllers
 {
-    [Route("api/v1/auth")]
     [ApiController]
+    [Route("api/v1/auth")]
     public class AuthController : ControllerBase
     {
         private readonly AppDbContext _context;
@@ -28,22 +29,39 @@ namespace GestionTareasApi.Controllers
         /// Registra un nuevo usuario.
         /// </summary>
         /// <param name="userDto">Datos del usuario</param>
-        /// <response code="200">Usuario registrado correctamente</response>
-        /// <response code="400">Datos inválidos</response>
+        /// <response code="201">Usuario creado correctamente</response>
+        /// <response code="400">El nombre de usuario ya existe o datos inválidos</response>
         [HttpPost("register")]
-        [SwaggerOperation(Summary = "Registra un nuevo usuario", Description = "Crea un nuevo usuario con un nombre de usuario y contraseña")]
-        [ProducesResponseType(typeof(string), 200)]
+        [SwaggerOperation(Summary = "Registra un nuevo usuario", Description = "Crea un usuario con nombre único y contraseña encriptada.")]
+        [ProducesResponseType(typeof(object), 201)]
         [ProducesResponseType(400)]
         public async Task<IActionResult> Register([FromBody] UserDto userDto)
         {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            // 1) Verificar que el nombre de usuario no exista (case-insensitive)
+            var exists = await _context.Users
+                .AnyAsync(u => u.Username.ToLower() == userDto.Username.ToLower());
+            if (exists)
+                return BadRequest(new { message = "El nombre de usuario ya existe." });
+
+            // 2) Crear entidad y persistir UNA SOLA VEZ
             var user = new User
             {
                 Username = userDto.Username,
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword(userDto.Password)
             };
-            _context.Users.Add(user);
+
+            await _context.Users.AddAsync(user);
             await _context.SaveChangesAsync();
-            return Ok("Usuario registrado");
+
+            // 3) Devolver 201 Created con location
+            return CreatedAtAction(
+                nameof(Login),
+                new { username = user.Username },
+                new { user.Id, user.Username }
+            );
         }
 
         /// <summary>
@@ -53,17 +71,24 @@ namespace GestionTareasApi.Controllers
         /// <response code="200">Token JWT generado correctamente</response>
         /// <response code="401">Credenciales incorrectas</response>
         [HttpPost("login")]
-        [SwaggerOperation(Summary = "Inicia sesión", Description = "Verifica las credenciales y devuelve un token JWT si son válidas")]
+        [SwaggerOperation(Summary = "Inicia sesión", Description = "Valida credenciales y devuelve un token JWT.")]
         [ProducesResponseType(typeof(object), 200)]
         [ProducesResponseType(401)]
         public async Task<IActionResult> Login([FromBody] UserDto userDto)
         {
-            var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == userDto.Username);
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            // 1) Buscar usuario
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username.ToLower() == userDto.Username.ToLower());
+
+            // 2) Verificar contraseña
             if (user == null || !BCrypt.Net.BCrypt.Verify(userDto.Password, user.PasswordHash))
-                return Unauthorized("Credenciales incorrectas");
+                return Unauthorized(new { message = "Credenciales incorrectas." });
 
+            // 3) Generar JWT
             var token = GenerateJwtToken(user);
-
             return Ok(new { Token = token });
         }
 
@@ -71,12 +96,17 @@ namespace GestionTareasApi.Controllers
         {
             var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]));
             var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-            var token = new JwtSecurityToken(
-                claims: new[] { new Claim(ClaimTypes.Name, user.Username) },
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new Claim(ClaimTypes.Name, user.Username)
+            };
+            var jwt = new JwtSecurityToken(
+                claims: claims,
                 expires: DateTime.UtcNow.AddHours(1),
                 signingCredentials: creds
             );
-            return new JwtSecurityTokenHandler().WriteToken(token);
+            return new JwtSecurityTokenHandler().WriteToken(jwt);
         }
     }
 }
